@@ -1,160 +1,189 @@
 # subject_parser.py
-import re
-from datetime import datetime
-from typing import Dict, Optional
+# Robust parser for thinkorswim alert email subjects (equities/ETFs and some futures options).
 
-_MONTHS = {
+from __future__ import annotations
+import re
+from typing import Optional, Dict
+
+# number pattern that accepts "1", "1.23", ".45"
+NUM = r"(?:\d+(?:\.\d+)?|\.\d+)"
+
+# Some subjects include an exchange code (CBOE, EDGX, NASDAQ BX, etc.) right before MARK=
+# Allow single- or multi-word prefixes ending with MARK=
+MARK_PREFIX = r"(?:[A-Z]+(?:\s+[A-Z]+)*)?MARK="
+
+MONTHS = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-    "JUL": 7, "AUG": 8, "SEP": 9, "SEPT": 9, "OCT": 10, "NOV": 11, "DEC": 12
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 
-# Handles things like:
-# "#82180613275 BOT +1 SPX 100 (Weeklys) 11 JUN 24 5315 PUT @.15MARK=5354.70 IMPL VOL=13.15% , ACCOUNT *****750SCHW"
-# "#66066620674 SOLD -12 SPY 100 17 MAY 24 500 PUT @.12MARK=520.79 IMPL VOL=13.29% , ACCOUNT *****0960TDA"
-# Also allows "(Weeklys)/(Weekly/Weeklies)" token, + or - sign on qty, and short option types P/C.
-_SUBJECT_RE = re.compile(r"""
-    ^\s*\#?(?P<trade_id>\d+)\s+
-    (?P<action>BOUGHT|BUY|BOT|SOLD|SELL|BTO|STO|BTC|STC)\s+
-    (?P<qtysign>[+-])?(?P<quantity>\d+)\s+
-    (?P<symbol>[A-Za-z0-9.\-]+)\s+
-    (?P<code>\d{1,4})
-    (?:\s+\((?:Weeklys?|Weeklies|Weekly)\)|\s+(?:Weeklys?|Weeklies|Weekly))?   # optional weekly token
-    \s+(?P<day>\d{1,2})\s+(?P<month>[A-Za-z]{3,})\s+(?P<year>\d{2,4})\s+
-    (?P<strike>\d+(?:\.\d+)?)\s+
-    (?P<otype>PUT|CALL|P|C)
-    (?:\s*@\s*(?P<price>\d*\.?\d+))?                            # @.15 or @2.80
-    (?:
-        .*?MARK\s*=\s*(?P<mark>\d+(?:\.\d+)?)                   # MARK=5354.70
-    )?
-    (?:
-        .*?\bIMPL\s*VOL\s*=\s*(?P<iv>\d*\.?\d+)%?               # IMPL VOL=13.29%
-    )?
-    (?:
-        .*?\bACCOUNT\b[^\d]*(?P<account>[\*\w\-]+)              # *****0960TDA
-    )?
-    \s*$""", re.IGNORECASE | re.VERBOSE)
-
-def _normalize_year(y: int) -> int:
-    return y if y >= 100 else 2000 + y
-
-def _month_to_int(m: str) -> Optional[int]:
-    if not m:
+def _to_float(s: Optional[str]) -> Optional[float]:
+    if s is None:
         return None
-    u = m.strip().upper()
-    if u.startswith("SEPT"):
-        u = "SEP"
-    return _MONTHS.get(u[:3])
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+def _iso_date(day: str, mon: str, yy: str) -> Optional[str]:
+    mon = (mon or "").upper()
+    if mon not in MONTHS:
+        return None
+    try:
+        y = 2000 + int(yy)
+        m = MONTHS[mon]
+        d = int(day)
+        return f"{y:04d}-{m:02d}-{d:02d}"
+    except Exception:
+        return None
+
+def _normalize_side(side_raw: str) -> str:
+    # Collapse BOT/SOLD to BUY/SELL
+    return "BUY" if side_raw == "BOT" else "SELL"
+
+# --- Regexes -----------------------------------------------------------------
+
+# Equities / ETFs / Index options (SPX, SPY, QQQ, NVDA, META, MSFT, etc.)
+EQUITY_RE = re.compile(
+    rf"""
+    ^\#(?P<trade_id>\d+)\s+
+    (?:[A-Za-z]+\s+)*?                     # optional noise like 'tIP'
+    (?P<side_raw>BOT|SOLD)\s+
+    (?P<qty>[+\-]?\d+)\s+
+    (?P<instrument>[A-Z]+)\s+              # e.g., NVDA, QQQ, SPX
+    (?P<contract_code>\d+)
+    (?:\s+\(Weeklys\))?\s+
+    (?P<day>\d{{1,2}})\s+(?P<mon>[A-Z]{{3}})\s+(?P<yy>\d{{2}})\s+
+    (?P<strike>{NUM})\s+
+    (?P<option_type>PUT|CALL)\s*@\s*(?P<price>{NUM})
+    \s*                                     # sometimes no space before MARK
+    {MARK_PREFIX}(?P<mark>{NUM})\s+
+    IMPL\ VOL=(?P<iv>{NUM})%\s*,\s*ACCOUNT\s+(?P<account>.+?)\s*$
+    """,
+    re.VERBOSE,
+)
+
+# Futures options (best-effort).
+FUT_OPT_RE = re.compile(
+    rf"""
+    ^\#(?P<trade_id>\d+)\s+
+    (?:[A-Za-z]+\s+)*?                         # optional noise like 'tIP'
+    (?P<side_raw>BOT|SOLD)\s+
+    (?P<qty>[+\-]?\d+)\s+
+    (?P<future_ct>/[A-Z]{{1,3}}[FGHJKMNQUVXZ]\d{{2}})\s+
+    (?P<contract_code>\d+/\d+)\s+              # e.g., 1/20, 1/50
+    (?P<mon>[A-Z]{{3}})\s+(?P<yy>\d{{2}})
+    (?:\s+\([^)]+\))*\s+                       # (Monday) (Wk4) etc.
+    (?P<opt_root>/[A-Z0-9]+)\s+
+    (?P<strike>{NUM})\s+(?P<option_type>PUT|CALL)\s*@\s*(?P<price>{NUM})
+    \s*
+    {MARK_PREFIX}(?P<mark>{NUM})\s+
+    IMPL\ VOL=(?P<iv>{NUM})%\s*,\s*ACCOUNT\s+(?P<account>.+?)\s*$
+    """,
+    re.VERBOSE,
+)
+
+# --- Public API ---------------------------------------------------------------
 
 def parse_trade_subject(subject: str) -> Dict[str, Optional[str]]:
     """
-    Returns DB-friendly fields (None when not parsed):
-      parse_ok, subject_raw,
-      trade_id, side (BUY/SELL),
-      quantity_signed, quantity_abs,
-      instrument, contract_code,
-      option_expiry (YYYY-MM-DD), strike, option_type,
-      fill_price, underlying_mark, implied_vol, account
+    Parse a thinkorswim subject line.
+
+    Returns a dict with:
+      parsed (bool), parse_ok (bool alias), trade_id, side, qty (abs int), signed_qty (int),
+      instrument, contract_code, option_date (YYYY-MM-DD when present),
+      strike (float), option_type, price (float), mark (float),
+      implied_vol (float), account (str)
+
+    On failure, returns parsed=False (and parse_ok=False) with fields as None.
     """
-    out = {
-        "parse_ok": False,
-        "subject_raw": subject,
+    subject = (subject or "").strip()
 
-        "trade_id": None,
-        "side": None,
+    def _empty(parsed: bool = False) -> Dict[str, Optional[str]]:
+        return {
+            "parsed": parsed,
+            "parse_ok": parsed,  # alias for backward compatibility
+            "trade_id": None,
+            "side": None,
+            "qty": None,
+            "signed_qty": None,
+            "instrument": None,
+            "contract_code": None,
+            "option_date": None,
+            "strike": None,
+            "option_type": None,
+            "price": None,
+            "mark": None,
+            "implied_vol": None,
+            "account": None,
+        }
 
-        "quantity_signed": None,
-        "quantity_abs": None,
+    # Try equity/ETF/index format
+    m = EQUITY_RE.match(subject)
+    if m:
+        g = m.groupdict()
+        side = _normalize_side(g["side_raw"])
+        qty_raw = int(g["qty"])
+        qty_abs = abs(qty_raw)
+        signed_qty = qty_abs if side == "BUY" else -qty_abs
 
-        "instrument": None,
-        "contract_code": None,
+        option_date = _iso_date(g["day"], g["mon"], g["yy"])
+        strike = _to_float(g["strike"])
+        price = _to_float(g["price"])
+        mark = _to_float(g["mark"])
+        iv = _to_float(g["iv"])
 
-        "option_expiry": None,
-        "strike": None,
-        "option_type": None,
+        return {
+            "parsed": True,
+            "parse_ok": True,
+            "trade_id": g["trade_id"],
+            "side": side,
+            "qty": qty_abs,
+            "signed_qty": signed_qty,
+            "instrument": g["instrument"],
+            "contract_code": g["contract_code"],  # usually "100"
+            "option_date": option_date,
+            "strike": strike,
+            "option_type": g["option_type"],
+            "price": price,
+            "mark": mark,
+            "implied_vol": iv,
+            "account": g["account"].strip(),
+        }
 
-        "fill_price": None,
-        "underlying_mark": None,
-        "implied_vol": None,
-        "account": None,
-    }
+    # Try futures options format (best effort)
+    m = FUT_OPT_RE.match(subject)
+    if m:
+        g = m.groupdict()
+        side = _normalize_side(g["side_raw"])
+        qty_raw = int(g["qty"])
+        qty_abs = abs(qty_raw)
+        signed_qty = qty_abs if side == "BUY" else -qty_abs
 
-    m = _SUBJECT_RE.search(subject or "")
-    if not m:
-        return out
+        strike = _to_float(g["strike"])
+        price = _to_float(g["price"])
+        mark = _to_float(g["mark"])
+        iv = _to_float(g["iv"])
 
-    g = m.groupdict()
+        instrument = g["future_ct"].lstrip("/")  # e.g., 'NQZ23', 'ESZ23'
 
-    # Side normalization
-    action = (g.get("action") or "").upper()
-    buy_actions = {"BOUGHT", "BUY", "BOT", "BTO", "BTC"}
-    sell_actions = {"SOLD", "SELL", "STO", "STC"}
-    side = "BUY" if action in buy_actions else ("SELL" if action in sell_actions else None)
+        return {
+            "parsed": True,
+            "parse_ok": True,
+            "trade_id": g["trade_id"],
+            "side": side,
+            "qty": qty_abs,
+            "signed_qty": signed_qty,
+            "instrument": instrument,
+            "contract_code": g["contract_code"],   # e.g., "1/20"
+            "option_date": None,                   # no specific day present
+            "strike": strike,
+            "option_type": g["option_type"],
+            "price": price,
+            "mark": mark,
+            "implied_vol": iv,
+            "account": g["account"].strip(),
+        }
 
-    # Quantity (signed, abs); explicit sign wins, else infer from side
-    qty = int(g.get("quantity") or "0")
-    sgn = (g.get("qtysign") or "")
-    if sgn == "-":
-        qty = -qty
-    elif sgn == "+":
-        qty = +qty
-    elif side == "SELL":
-        qty = -qty
-    qty_abs = abs(qty)
-
-    # Expiry date
-    day = int(g.get("day") or 1)
-    mon = _month_to_int(g.get("month") or "")
-    yr_raw = int(g.get("year") or 0)
-    yr = _normalize_year(yr_raw) if yr_raw else None
-    expiry_iso = None
-    if mon and yr:
-        try:
-            expiry_iso = datetime(yr, mon, day).strftime("%Y-%m-%d")
-        except ValueError:
-            expiry_iso = None
-
-    # Option type
-    o = (g.get("otype") or "").upper()
-    opt_type = "CALL" if o in ("CALL", "C") else ("PUT" if o in ("PUT", "P") else None)
-
-    # Price, mark, iv
-    price = g.get("price")
-    mark = g.get("mark")
-    iv = g.get("iv")
-
-    # Fallbacks (be extra sure MARK / IV are found even if formats drift)
-    if not mark:
-        m2 = re.search(r"MARK\s*=\s*(\d+(?:\.\d+)?)", subject or "", re.IGNORECASE)
-        if m2:
-            mark = m2.group(1)
-    if not iv:
-        m3 = re.search(r"IMPL\s*VOL\s*=\s*(\d*\.?\d+)%?", subject or "", re.IGNORECASE)
-        if m3:
-            iv = m3.group(1)
-
-    # Account (strip leading asterisks if present)
-    account = g.get("account") or None
-    if account:
-        account = account.lstrip("*")
-
-    out.update({
-        "parse_ok": True,
-        "trade_id": g.get("trade_id"),
-        "side": side,
-
-        "quantity_signed": qty,
-        "quantity_abs": qty_abs,
-
-        "instrument": (g.get("symbol") or "").upper(),
-        "contract_code": g.get("code"),
-
-        "option_expiry": expiry_iso,
-        "strike": g.get("strike"),
-        "option_type": opt_type,
-
-        "fill_price": price,
-        "underlying_mark": mark,
-        "implied_vol": iv,
-        "account": account,
-    })
-    return out
+    # No match
+    return _empty(False)
